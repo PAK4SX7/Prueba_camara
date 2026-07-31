@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📷 Cámara - Emisor</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            background: #111;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background: #1a1a1a;
+            border-radius: 20px;
+            padding: 30px;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8);
+            border: 1px solid #333;
+            text-align: center;
+        }
+        h1 {
+            color: #fff;
+            font-size: 24px;
+            margin-bottom: 10px;
+        }
+        .sub {
+            color: #aaa;
+            font-size: 14px;
+            margin-bottom: 30px;
+        }
+        .pregunta {
+            background: #222;
+            border-radius: 16px;
+            padding: 25px;
+            margin: 20px 0;
+            border-left: 4px solid #ffaa00;
+        }
+        .pregunta p {
+            color: #fff;
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 20px;
+        }
+        .btn-group {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+        }
+        .btn {
+            padding: 12px 40px;
+            border: none;
+            border-radius: 50px;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .btn-si {
+            background: #00c853;
+            color: #fff;
+            box-shadow: 0 4px 15px rgba(0,200,83,0.3);
+        }
+        .btn-si:hover {
+            transform: scale(1.05);
+            background: #00e676;
+        }
+        .btn-no {
+            background: #d32f2f;
+            color: #fff;
+            box-shadow: 0 4px 15px rgba(211,47,47,0.3);
+        }
+        .btn-no:hover {
+            transform: scale(1.05);
+            background: #f44336;
+        }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+        video {
+            width: 100%;
+            max-width: 100%;
+            border-radius: 12px;
+            margin-top: 20px;
+            background: #000;
+            transform: scaleX(-1);
+            display: none; /* oculto hasta que se acepte */
+        }
+        .info {
+            margin-top: 20px;
+            color: #0f0;
+            font-size: 14px;
+            background: rgba(0,0,0,0.6);
+            padding: 12px;
+            border-radius: 10px;
+            font-family: monospace;
+        }
+        .error-msg {
+            color: #ff5252;
+            background: #2a0a0a;
+            border: 1px solid #ff1744;
+            padding: 12px;
+            border-radius: 10px;
+            margin-top: 15px;
+            display: none;
+        }
+        .id-label {
+            color: #888;
+            font-size: 13px;
+        }
+        .id-label strong {
+            color: #00bcd4;
+        }
+        .footer {
+            margin-top: 25px;
+            color: #555;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container" id="app">
+    <h1>📹 Cámara de seguridad</h1>
+    <div class="sub">Sistema de videovigilancia</div>
+
+    <!-- Pantalla de pregunta de edad -->
+    <div id="pantallaPregunta">
+        <div class="pregunta">
+            <p>🔞 ¿Eres mayor de 18 años?</p>
+            <div class="btn-group">
+                <button class="btn btn-si" id="btnSi">✔ Sí</button>
+                <button class="btn btn-no" id="btnNo">✖ No</button>
+            </div>
+        </div>
+        <div class="footer">Para usar la cámara debes confirmar tu mayoría de edad.</div>
+    </div>
+
+    <!-- Zona de video (se muestra después del "Sí") -->
+    <div id="zonaVideo" style="display: none;">
+        <video id="video" autoplay playsinline muted></video>
+        <div class="info">
+            <div id="status">🔄 Iniciando cámara...</div>
+            <div class="id-label">ID del emisor: <strong id="peerId">cargando...</strong></div>
+        </div>
+        <div id="errorContainer" class="error-msg"></div>
+    </div>
+</div>
+
+<script src="https://unpkg.com/peerjs@1.5.1/dist/peerjs.min.js"></script>
+
+<script>
+    (function() {
+        const btnSi = document.getElementById('btnSi');
+        const btnNo = document.getElementById('btnNo');
+        const pantallaPregunta = document.getElementById('pantallaPregunta');
+        const zonaVideo = document.getElementById('zonaVideo');
+        const video = document.getElementById('video');
+        const statusEl = document.getElementById('status');
+        const peerIdEl = document.getElementById('peerId');
+        const errorContainer = document.getElementById('errorContainer');
+
+        let stream = null;
+        let peer = null;
+
+        // Función para mostrar errores en la interfaz
+        function mostrarError(mensaje) {
+            errorContainer.textContent = '❌ ' + mensaje;
+            errorContainer.style.display = 'block';
+            statusEl.textContent = '⚠️ Error';
+            statusEl.style.color = '#ff5252';
+        }
+
+        function ocultarError() {
+            errorContainer.style.display = 'none';
+        }
+
+        // Función para iniciar la cámara y PeerJS
+        async function iniciarCamara() {
+            ocultarError();
+            statusEl.textContent = '📷 Solicitando acceso a la cámara...';
+            statusEl.style.color = '#ffaa00';
+
+            try {
+                // 1. Obtener stream de la cámara (trasera en móviles)
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' },
+                    audio: false
+                });
+                video.srcObject = stream;
+                video.style.display = 'block';
+                statusEl.textContent = '✅ Cámara activa, conectando a PeerJS...';
+                statusEl.style.color = '#0f0';
+            } catch (err) {
+                console.error('Error al acceder a la cámara:', err);
+                let mensaje = 'No se pudo acceder a la cámara: ';
+                if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                    mensaje += 'Permiso denegado por el usuario o el navegador. ' +
+                               'Asegúrate de dar permisos y recarga la página.';
+                } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+                    mensaje += 'No se encontró ninguna cámara en este dispositivo.';
+                } else {
+                    mensaje += err.message;
+                }
+                mostrarError(mensaje);
+                statusEl.textContent = '❌ Error de cámara';
+                statusEl.style.color = '#ff5252';
+                return;
+            }
+
+            // 2. Crear peer con ID fijo
+            const peerId = 'camara-seguridad-2026';
+            peer = new Peer(peerId, {
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                }
+            });
+
+            peer.on('open', (id) => {
+                peerIdEl.textContent = id;
+                statusEl.textContent = '✅ Cámara lista, esperando receptor...';
+                statusEl.style.color = '#0f0';
+                ocultarError();
+            });
+
+            peer.on('call', (call) => {
+                console.log('Llamada entrante, respondiendo...');
+                call.answer(stream);
+                statusEl.textContent = '📡 Transmitiendo en vivo a un receptor';
+                statusEl.style.color = '#00e5ff';
+            });
+
+            peer.on('error', (err) => {
+                console.error('Error PeerJS:', err);
+                let msg = 'Error de conexión: ' + err.type;
+                if (err.type === 'peer-unavailable') {
+                    msg = 'El ID ya está en uso. Espera unos segundos y recarga.';
+                } else if (err.type === 'network') {
+                    msg = 'Problema de red. Verifica tu conexión a Internet.';
+                }
+                mostrarError(msg);
+                statusEl.textContent = '⚠️ Error PeerJS';
+                statusEl.style.color = '#ffaa00';
+            });
+
+            // Mostrar el ID fijo
+            peerIdEl.textContent = peerId;
+
+            // Si el peer no se abre en 8 segundos, mostrar advertencia
+            setTimeout(() => {
+                if (!peer.id) {
+                    statusEl.textContent = '⏳ Esperando servidor PeerJS...';
+                    statusEl.style.color = '#ffaa00';
+                }
+            }, 3000);
+        }
+
+        // --- Evento "Sí" ---
+        btnSi.addEventListener('click', () => {
+            // Deshabilitar botones para evitar doble clic
+            btnSi.disabled = true;
+            btnNo.disabled = true;
+            btnSi.textContent = '⏳ Cargando...';
+
+            // Ocultar la pregunta y mostrar la zona de video
+            pantallaPregunta.style.display = 'none';
+            zonaVideo.style.display = 'block';
+
+            // Iniciar la cámara
+            iniciarCamara();
+        });
+
+        // --- Evento "No" ---
+        btnNo.addEventListener('click', () => {
+            // Mostrar un mensaje de bloqueo
+            const preguntaDiv = document.querySelector('.pregunta');
+            preguntaDiv.innerHTML = `
+                <p style="color:#ff5252;">⛔ Acceso denegado</p>
+                <p style="color:#aaa; font-size:16px; font-weight:normal;">
+                    Debes ser mayor de 18 años para usar esta cámara.
+                </p>
+                <button class="btn btn-si" id="btnReintentar" style="margin-top:15px;">
+                    🔄 Reintentar
+                </button>
+            `;
+            document.querySelector('.footer').textContent = 'Si eres mayor, haz clic en "Reintentar".';
+
+            // Agregar evento al botón de reintentar
+            document.getElementById('btnReintentar').addEventListener('click', () => {
+                location.reload(); // recarga la página para reiniciar
+            });
+        });
+
+    })();
+</script>
+</body>
+</html>
