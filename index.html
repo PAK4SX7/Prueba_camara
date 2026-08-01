@@ -142,14 +142,14 @@
     font-style: italic;
   }
 
-  /* ---------- Vista previa del texto detectado debajo del QR ---------- */
+  /* ---------- Texto leído debajo del QR (OCR) ---------- */
   .text-preview{
     display: none;
     position: fixed;
     top: max(9vh, calc(env(safe-area-inset-top) + 66px));
     left: 50%;
     transform: translateX(-50%);
-    padding: 8px 12px;
+    padding: 10px 16px;
     background: rgba(20,20,20,0.92);
     border: 1px solid rgba(255,255,255,0.3);
     border-radius: 10px;
@@ -160,18 +160,26 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 6px;
+    gap: 4px;
   }
-  .text-preview span{
-    color: rgba(255,255,255,0.8);
-    font-size: 11.5px;
+  .text-preview .label{
+    color: rgba(255,255,255,0.65);
+    font-size: 11px;
     text-align: center;
   }
-  .text-preview canvas{
-    image-rendering: pixelated;
-    border-radius: 4px;
-    max-width: 100%;
-    max-height: 12vh;
+  .text-preview .result{
+    color: #ffffff;
+    font-size: 16px;
+    font-weight: 600;
+    text-align: center;
+    max-width: 78vw;
+    overflow-wrap: break-word;
+  }
+  .text-preview .result.loading{
+    color: rgba(255,255,255,0.6);
+    font-weight: 400;
+    font-style: italic;
+    font-size: 13.5px;
   }
 
   /* ---------- Botón inferior: Subir imagen ---------- */
@@ -296,8 +304,8 @@
     </div>
     <p class="scan-text">Enfoca el código QR dentro del recuadro</p>
     <div class="text-preview" id="textPreview">
-      <span>Esto es lo que se está leyendo debajo del QR:</span>
-      <canvas id="textPreviewCanvas"></canvas>
+      <span class="label">Texto detectado debajo del QR:</span>
+      <span class="result" id="textPreviewResult">Leyendo...</span>
     </div>
   </div>
 
@@ -10429,6 +10437,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 /******/ ])["default"];
 });
 </script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <script>
   // ---------------------------------------------------------
   // Cámara en vivo + detección de QR con jsQR.
@@ -10447,8 +10456,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   const ctx        = canvas.getContext('2d', { willReadFrequently: true });
   const scanText   = document.querySelector('.scan-text');
   const textPreview = document.getElementById('textPreview');
-  const textPreviewCanvas = document.getElementById('textPreviewCanvas');
-  const textPreviewCtx = textPreviewCanvas.getContext('2d');
+  const textPreviewResult = document.getElementById('textPreviewResult');
 
   const DEFAULT_MESSAGE = 'Enfoca el código QR dentro del recuadro';
   let scanning = false;
@@ -10458,6 +10466,120 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   let errorShown = false;
   let frameCount = 0;
   let consecutiveFails = 0;
+
+  // ---------------------------------------------------------
+  // OCR real (Tesseract.js) del texto que aparece debajo del QR.
+  // Se corre en segundo plano, sin bloquear la detección del QR
+  // (que sigue siendo instantánea). La primera vez que se usa tarda
+  // un poco más porque descarga el motor de lectura; las siguientes
+  // veces es más rápido.
+  // ---------------------------------------------------------
+  let ocrWorkerPromise = null;
+  let ocrBusy = false;
+  let ocrLastKey = null;
+
+  function getOcrWorker(){
+    if (!ocrWorkerPromise) {
+      ocrWorkerPromise = Tesseract.createWorker('spa').catch(err => {
+        ocrWorkerPromise = null;
+        throw err;
+      });
+    }
+    return ocrWorkerPromise;
+  }
+
+  function cropBelowQR(imageData, qrBox){
+    const { width, height } = imageData;
+    const top = Math.max(0, Math.round(qrBox.maxY));
+    const bottom = Math.min(height, top + Math.round((qrBox.maxY - qrBox.minY) * 0.35));
+    const left = Math.max(0, Math.round(qrBox.minX));
+    const right = Math.min(width, Math.round(qrBox.maxX));
+    const w = right - left;
+    const h = bottom - top;
+    if (w <= 4 || h <= 4) return null;
+
+    // Ampliamos el recorte porque Tesseract lee mucho mejor un texto
+    // grande y nítido que uno diminuto.
+    const scale = Math.min(6, Math.max(1, 220 / h));
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = w;
+    tempCanvas.height = h;
+    tempCanvas.getContext('2d').putImageData(imageData, -left, -top, left, top, w, h);
+
+    const ocrCanvas = document.createElement('canvas');
+    ocrCanvas.width = Math.round(w * scale);
+    ocrCanvas.height = Math.round(h * scale);
+    const octx = ocrCanvas.getContext('2d');
+    octx.imageSmoothingEnabled = true;
+    octx.drawImage(tempCanvas, 0, 0, ocrCanvas.width, ocrCanvas.height);
+    return ocrCanvas;
+  }
+
+  async function runOcr(imageData, qrBox, key){
+    ocrBusy = true;
+    try {
+      const ocrCanvas = cropBelowQR(imageData, qrBox);
+      if (!ocrCanvas) {
+        ocrBusy = false;
+        return;
+      }
+      const worker = await getOcrWorker();
+      const { data } = await worker.recognize(ocrCanvas);
+      const text = (data && data.text ? data.text : '').replace(/\s+/g, ' ').trim();
+
+      if (key === currentOcrTargetKey()) {
+        if (text) {
+          textPreviewResult.textContent = text;
+          textPreviewResult.classList.remove('loading');
+        } else {
+          textPreviewResult.textContent = 'No se pudo leer el texto con claridad';
+          textPreviewResult.classList.add('loading');
+        }
+      }
+    } catch (err) {
+      console.error('Error en OCR:', err);
+      if (key === currentOcrTargetKey()) {
+        textPreviewResult.textContent = 'No se pudo leer el texto';
+        textPreviewResult.classList.add('loading');
+      }
+    } finally {
+      ocrBusy = false;
+    }
+  }
+
+  // Clave con la que identificamos "el mismo QR/zona de texto" para no
+  // relanzar el OCR en cada frame mientras se sigue viendo lo mismo.
+  let lastOcrKey = null;
+  function currentOcrTargetKey(){ return lastOcrKey; }
+
+  function ocrKeyFor(decoded, qrBox){
+    if (decoded) return 'decoded:' + decoded;
+    return 'box:' + Math.round(qrBox.minX / 25) + ',' + Math.round(qrBox.minY / 25) + ',' + Math.round(qrBox.maxX / 25);
+  }
+
+  function showTextBelowResult(imageData, qrBox, decoded){
+    if (!imageData || !qrBox) {
+      textPreview.classList.remove('visible');
+      lastOcrKey = null;
+      return;
+    }
+
+    const key = ocrKeyFor(decoded, qrBox);
+    textPreview.classList.add('visible');
+
+    if (key === ocrLastKey) {
+      // Ya tenemos (o tuvimos) resultado para esto: no relanzamos OCR.
+      return;
+    }
+
+    lastOcrKey = key;
+    textPreviewResult.textContent = 'Leyendo...';
+    textPreviewResult.classList.add('loading');
+
+    if (!ocrBusy) {
+      runOcr(imageData, qrBox, key);
+    }
+  }
 
   closeBtn.addEventListener('click', () => {
     stopCamera();
@@ -11073,13 +11195,17 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       // No mostramos el contenido decodificado, solo la confirmación.
       const withText = qrBox ? hasTextBelow(imageData, qrBox) : false;
       setMessage(withText ? '✅ Es un código QR (con un nombre debajo)' : '✅ Es un código QR', 'found');
-      updateTextPreview(withText ? imageData : null, qrBox);
+      if (withText) {
+        showTextBelowResult(imageData, qrBox, decoded);
+      } else {
+        showTextBelowResult(null, null, null);
+      }
       lastValue = 'qr-detectado';
       return;
     }
 
     if (!qrBox) {
-      updateTextPreview(null, null);
+      showTextBelowResult(null, null, null);
       return;
     }
 
@@ -11088,48 +11214,12 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     const withText = hasTextBelow(imageData, qrBox);
     if (withText) {
       setMessage('✅ Es un código QR (con un nombre debajo)', 'found');
+      showTextBelowResult(imageData, qrBox, null);
     } else {
       setMessage('✅ Es un código QR (sin texto debajo)', 'found');
+      showTextBelowResult(null, null, null);
     }
-    updateTextPreview(withText ? imageData : null, qrBox);
     lastValue = 'qr-detectado-parcial';
-  }
-
-  // Muestra un recorte ampliado de la franja debajo del QR, para que se
-  // pueda comprobar a simple vista que la app realmente está "viendo"
-  // ese texto y no lo está inventando. No es reconocimiento de texto
-  // (OCR): eso requeriría una librería pesada que metería demora.
-  function updateTextPreview(imageData, qrBox){
-    if (!imageData || !qrBox) {
-      textPreview.classList.remove('visible');
-      return;
-    }
-
-    const { data, width, height } = imageData;
-    const top = Math.max(0, Math.round(qrBox.maxY));
-    const bottom = Math.min(height, top + Math.round((qrBox.maxY - qrBox.minY) * 0.35));
-    const left = Math.max(0, Math.round(qrBox.minX));
-    const right = Math.min(width, Math.round(qrBox.maxX));
-    const w = right - left;
-    const h = bottom - top;
-    if (w <= 0 || h <= 0) {
-      textPreview.classList.remove('visible');
-      return;
-    }
-
-    // Recortamos la franja y la ampliamos para que se lea con claridad.
-    const cropCanvas = document.createElement('canvas');
-    cropCanvas.width = w;
-    cropCanvas.height = h;
-    cropCanvas.getContext('2d').putImageData(imageData, -left, -top, left, top, w, h);
-
-    const zoom = Math.min(4, Math.max(1, 260 / w));
-    textPreviewCanvas.width = Math.round(w * zoom);
-    textPreviewCanvas.height = Math.round(h * zoom);
-    textPreviewCtx.imageSmoothingEnabled = true;
-    textPreviewCtx.drawImage(cropCanvas, 0, 0, textPreviewCanvas.width, textPreviewCanvas.height);
-
-    textPreview.classList.add('visible');
   }
 
   function setMessage(text, state){
