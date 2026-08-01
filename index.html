@@ -10406,6 +10406,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   const flashBtn   = document.getElementById('flashBtn');
   const fileInput  = document.getElementById('file-input');
   const video      = document.getElementById('preview');
+  const viewfinder = document.getElementById('viewfinder');
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d', { willReadFrequently: true });
   const scanText   = document.querySelector('.scan-text');
@@ -10477,8 +10478,8 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: 'environment',
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
         },
         audio: false
       });
@@ -10505,6 +10506,38 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     flashOn = false;
   }
 
+  function getViewfinderSourceRect(){
+    const videoRect = video.getBoundingClientRect();
+    const vfRect = viewfinder.getBoundingClientRect();
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+
+    if (!vw || !vh || !videoRect.width || !videoRect.height) return null;
+
+    // El video usa object-fit: cover, así que hay que traducir
+    // coordenadas de pantalla a coordenadas reales del video.
+    const scale = Math.max(videoRect.width / vw, videoRect.height / vh);
+    const scaledW = vw * scale;
+    const scaledH = vh * scale;
+    const offsetX = (scaledW - videoRect.width) / 2;
+    const offsetY = (scaledH - videoRect.height) / 2;
+
+    const tx = vfRect.left - videoRect.left;
+    const ty = vfRect.top - videoRect.top;
+
+    let sx = (tx + offsetX) / scale;
+    let sy = (ty + offsetY) / scale;
+    let sw = vfRect.width / scale;
+    let sh = vfRect.height / scale;
+
+    sx = Math.max(0, Math.min(sx, vw - 1));
+    sy = Math.max(0, Math.min(sy, vh - 1));
+    sw = Math.max(1, Math.min(sw, vw - sx));
+    sh = Math.max(1, Math.min(sh, vh - sy));
+
+    return { sx, sy, sw, sh };
+  }
+
   function tick(){
     if (!scanning) return;
 
@@ -10514,18 +10547,28 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
 
       if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
-        const MAX_WIDTH = 720;
-        const scale = video.videoWidth > MAX_WIDTH ? MAX_WIDTH / video.videoWidth : 1;
-        canvas.width = Math.round(video.videoWidth * scale);
-        canvas.height = Math.round(video.videoHeight * scale);
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const code = jsQR(imageData.data, imageData.width, imageData.height, {
-          inversionAttempts: 'attemptBoth'
-        });
+        const rect = getViewfinderSourceRect();
 
-        if (code) {
-          handleResult(code);
+        if (rect) {
+          const MAX_DIM = 800;
+          const outScale = Math.min(1, MAX_DIM / Math.max(rect.sw, rect.sh));
+          canvas.width = Math.max(1, Math.round(rect.sw * outScale));
+          canvas.height = Math.max(1, Math.round(rect.sh * outScale));
+
+          ctx.drawImage(
+            video,
+            rect.sx, rect.sy, rect.sw, rect.sh,
+            0, 0, canvas.width, canvas.height
+          );
+
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'attemptBoth'
+          });
+
+          if (code) {
+            handleResult(code);
+          }
         }
       }
     } catch (err) {
