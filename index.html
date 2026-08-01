@@ -10430,7 +10430,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   flashBtn.addEventListener('click', toggleFlash);
 
   async function toggleFlash(){
-    if (!currentTrack) return;
+    if (!currentTrack) {
+      flashUnavailable('Cámara no lista aún');
+      return;
+    }
 
     const capabilities = currentTrack.getCapabilities ? currentTrack.getCapabilities() : {};
     if (!capabilities.torch) {
@@ -10450,25 +10453,61 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
   }
 
-  function flashUnavailable(){
+  function flashUnavailable(reason){
     const label = flashBtn.querySelector('span');
     const original = 'Encender linterna';
-    label.textContent = 'Linterna no disponible';
+    label.textContent = reason || 'Linterna no disponible en este navegador';
     flashBtn.classList.remove('active');
-    setTimeout(() => { label.textContent = original; }, 2200);
+    setTimeout(() => { label.textContent = original; }, 2400);
+  }
+
+  function tryDecodeAtScale(img, targetMaxDim){
+    const scale = Math.min(1, targetMaxDim / Math.max(img.width, img.height));
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    canvas.width = w;
+    canvas.height = h;
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    const imageData = ctx.getImageData(0, 0, w, h);
+    return jsQR(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts: 'attemptBoth'
+    });
   }
 
   fileInput.addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (!file) return;
+
+    setMessage('Analizando imagen...', 'empty');
+
     const img = new Image();
     img.onload = () => {
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const code = jsQR(imageData.data, imageData.width, imageData.height);
+      // Se intenta a varias resoluciones porque una imagen muy grande
+      // o muy pequeña puede impedir que jsQR ubique los patrones del QR.
+      const attempts = [
+        Math.max(img.width, img.height),
+        1600, 1000, 700, 2400
+      ];
+
+      let code = null;
+      for (const dim of attempts) {
+        code = tryDecodeAtScale(img, dim);
+        if (code) break;
+      }
+
+      if (!code) {
+        setMessage('No se detectó ningún QR en la imagen. Prueba con una foto más nítida, bien enfocada y de frente.', 'empty');
+        fileInput.value = '';
+        return;
+      }
+
       handleResult(code);
+      fileInput.value = '';
+    };
+    img.onerror = () => {
+      setMessage('No se pudo abrir la imagen seleccionada', 'empty');
+      fileInput.value = '';
     };
     img.src = URL.createObjectURL(file);
   });
@@ -10550,7 +10589,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         const rect = getViewfinderSourceRect();
 
         if (rect) {
-          const MAX_DIM = 800;
+          const MAX_DIM = 1000;
           const outScale = Math.min(1, MAX_DIM / Math.max(rect.sw, rect.sh));
           canvas.width = Math.max(1, Math.round(rect.sw * outScale));
           canvas.height = Math.max(1, Math.round(rect.sh * outScale));
