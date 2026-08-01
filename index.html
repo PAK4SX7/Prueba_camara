@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Escanear QR</title>
+<style>
+  :root{
+    --blue: #3478D2;
+    --purple: #6B2980;
+    --light-purple: #C08FE0;
+    --border-gray: rgba(255,255,255,0.4);
+    --ghost-bg: rgba(255,255,255,0.08);
+  }
+
+  *{
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html, body{
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000000;
+    overscroll-behavior: none;
+  }
+
+  body{
+    font-family: 'Google Sans', 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .screen{
+    position: fixed;
+    inset: 0;
+    background: #000000;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  /* ---------- Botón cerrar (X) ---------- */
+  .close-btn{
+    position: absolute;
+    top: max(2.8vh, calc(env(safe-area-inset-top) + 14px));
+    right: 6.5vw;
+    width: clamp(38px, 10.4vw, 58px);
+    height: clamp(38px, 10.4vw, 58px);
+    border-radius: 50%;
+    background: var(--ghost-bg);
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+    z-index: 30;
+    transition: background 0.15s ease, transform 0.1s ease;
+  }
+  .close-btn:active{
+    background: rgba(255,255,255,0.16);
+    transform: scale(0.94);
+  }
+  .close-btn svg{
+    width: 46%;
+    height: 46%;
+  }
+
+  /* ---------- Línea horizontal central del visor ---------- */
+  .scan-line{
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    height: 3px;
+    background: var(--light-purple);
+    border-radius: 3px;
+    z-index: 5;
+    box-shadow: 0 0 8px rgba(192,143,224,0.7);
+  }
+
+  /* ---------- Zona central (visor + texto) ---------- */
+  .main-content{
+    position: absolute;
+    top: 29vh;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+    padding: 0 8vw;
+    z-index: 2;
+  }
+
+  .viewfinder{
+    width: min(52.9vw, 420px);
+    aspect-ratio: 1 / 1;
+    border: none;
+    border-radius: clamp(14px, 2.2vw, 26px);
+    background: transparent;
+    position: relative;
+    box-shadow: 0 0 0 9999px rgba(0,0,0,0.9);
+  }
+
+  .camera-feed{
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: #000000;
+    z-index: 0;
+  }
+
+  .scan-text{
+    margin-top: clamp(20px, 3.6vh, 34px);
+    color: #ffffff;
+    font-size: clamp(15px, 4.3vw, 20px);
+    font-weight: 400;
+    text-align: center;
+    letter-spacing: 0.1px;
+    opacity: 0.96;
+    transition: color 0.15s ease;
+  }
+
+  .scan-text.found{
+    font-weight: 600;
+    font-size: clamp(17px, 4.8vw, 22px);
+    color: var(--light-purple);
+  }
+
+  .scan-text.empty{
+    color: rgba(255,255,255,0.55);
+    font-style: italic;
+  }
+
+  /* ---------- Botón inferior: Subir imagen ---------- */
+  .upload-btn{
+    position: absolute;
+    left: 50%;
+    --upload-bottom: max(3.6vh, calc(env(safe-area-inset-bottom) + 18px));
+    --upload-height: clamp(50px, 6.2vh, 74px);
+    bottom: var(--upload-bottom);
+    transform: translateX(-50%);
+    width: min(88vw, 560px);
+    height: var(--upload-height);
+    background: #ffffff;
+    border: none;
+    border-radius: clamp(16px, 2.6vw, 28px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(10px, 2.6vw, 18px);
+    cursor: pointer;
+    padding: 0 clamp(14px, 4vw, 26px);
+    z-index: 30;
+    transition: filter 0.15s ease, transform 0.1s ease;
+  }
+  .upload-btn:active{
+    filter: brightness(0.94);
+    transform: translateX(-50%) scale(0.985);
+  }
+  .upload-btn svg{
+    width: clamp(22px, 5.6vw, 30px);
+    height: clamp(22px, 5.6vw, 30px);
+    flex-shrink: 0;
+  }
+  .upload-btn span{
+    color: #1a1a1a;
+    font-size: clamp(14.5px, 4.1vw, 18.5px);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  #file-input{
+    display: none;
+  }
+
+  /* ---------- Botón: Encender linterna ---------- */
+  .flash-btn{
+    position: absolute;
+    left: 50%;
+    bottom: calc(var(--upload-bottom) + var(--upload-height) + clamp(12px, 2vh, 20px));
+    transform: translateX(-50%);
+    width: min(56vw, 320px);
+    height: clamp(38px, 4.6vh, 50px);
+    background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: clamp(12px, 2.2vw, 22px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(7px, 1.8vw, 12px);
+    cursor: pointer;
+    padding: 0 clamp(10px, 3vw, 18px);
+    z-index: 30;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+  }
+  .flash-btn:active{
+    transform: translateX(-50%) scale(0.96);
+  }
+  .flash-btn.active{
+    background: var(--light-purple);
+    border-color: var(--light-purple);
+  }
+  .flash-btn.active span,
+  .flash-btn.active svg path,
+  .flash-btn.active svg polygon{
+    color: #1a1a1a;
+  }
+  .flash-btn svg{
+    width: clamp(16px, 4.2vw, 20px);
+    height: clamp(16px, 4.2vw, 20px);
+    flex-shrink: 0;
+  }
+  .flash-btn span{
+    color: #ffffff;
+    font-size: clamp(12.5px, 3.4vw, 15px);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .flash-btn.active span{
+    color: #1a1a1a;
+  }
+  .flash-btn.active svg polygon{
+    fill: #1a1a1a;
+  }
+
+  @media (min-width: 720px){
+    .screen{
+      max-width: 560px;
+      margin: 0 auto;
+      border-left: 1px solid rgba(255,255,255,0.06);
+      border-right: 1px solid rgba(255,255,255,0.06);
+    }
+  }
+</style>
+</head>
+<body>
+
+<div class="screen" id="screen">
+
+  <!-- Cámara en vivo (fondo completo) -->
+  <video id="preview" class="camera-feed" playsinline muted autoplay></video>
+  <canvas id="canvas" style="display:none;"></canvas>
+
+  <!-- Botón cerrar -->
+  <button class="close-btn" id="closeBtn" aria-label="Cerrar">
+    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M18 6L6 18M6 6L18 18" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+  </button>
+
+  <!-- Visor + texto -->
+  <div class="main-content">
+    <div class="viewfinder" id="viewfinder">
+      <div class="scan-line"></div>
+    </div>
+    <p class="scan-text">Enfoca el código QR dentro del recuadro</p>
+  </div>
+
+  <!-- Botón encender linterna -->
+  <button class="flash-btn" id="flashBtn">
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <polygon points="13,2 4,14 11,14 10,22 20,10 13,10" fill="#ffffff"/>
+    </svg>
+    <span>Encender linterna</span>
+  </button>
+
+  <!-- Botón subir imagen -->
+  <button class="upload-btn" id="uploadBtn">
+    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect x="2.5" y="4.5" width="19" height="15" rx="2.3" stroke="#6B2980" stroke-width="1.7"/>
+      <circle cx="8.3" cy="10" r="1.7" stroke="#6B2980" stroke-width="1.6"/>
+      <path d="M4 17L9 12.2C9.5 11.7 10.3 11.7 10.8 12.2L13 14.3" stroke="#6B2980" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M12 16L15.7 12.4C16.2 11.9 17 11.9 17.5 12.4L20.2 15" stroke="#6B2980" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <span>Subir una imagen con QR</span>
+  </button>
+
+  <input type="file" id="file-input" accept="image/*">
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
+<script>
+  // ---------------------------------------------------------
+  // Cámara en vivo + detección de QR con jsQR.
+  // Al detectar un QR, se muestra únicamente el contenido
+  // (tratado como "nombre"). Si el QR no trae nada, se
+  // muestra "Sin nombre". Sin QR detectado, no se muestra nada.
+  // ---------------------------------------------------------
+
+  const closeBtn   = document.getElementById('closeBtn');
+  const uploadBtn  = document.getElementById('uploadBtn');
+  const flashBtn   = document.getElementById('flashBtn');
+  const fileInput  = document.getElementById('file-input');
+  const video      = document.getElementById('preview');
+  const canvas     = document.getElementById('canvas');
+  const ctx        = canvas.getContext('2d', { willReadFrequently: true });
+  const scanText   = document.querySelector('.scan-text');
+
+  const DEFAULT_MESSAGE = 'Enfoca el código QR dentro del recuadro';
+  let scanning = false;
+  let lastValue = null;
+  let currentTrack = null;
+  let flashOn = false;
+
+  closeBtn.addEventListener('click', () => {
+    stopCamera();
+    console.log('Cerrar escáner');
+  });
+
+  uploadBtn.addEventListener('click', () => {
+    fileInput.click();
+  });
+
+  flashBtn.addEventListener('click', toggleFlash);
+
+  async function toggleFlash(){
+    if (!currentTrack) return;
+
+    const capabilities = currentTrack.getCapabilities ? currentTrack.getCapabilities() : {};
+    if (!capabilities.torch) {
+      console.warn('Este dispositivo no soporta linterna desde el navegador.');
+      return;
+    }
+
+    try {
+      flashOn = !flashOn;
+      await currentTrack.applyConstraints({ advanced: [{ torch: flashOn }] });
+      flashBtn.classList.toggle('active', flashOn);
+      flashBtn.querySelector('span').textContent = flashOn ? 'Apagar linterna' : 'Encender linterna';
+    } catch (err) {
+      console.error('No se pudo controlar la linterna:', err);
+      flashOn = !flashOn; // revertir estado si falla
+    }
+  }
+
+  fileInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height);
+      handleResult(code);
+    };
+    img.src = URL.createObjectURL(file);
+  });
+
+  async function startCamera(){
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      scanning = true;
+
+      currentTrack = stream.getVideoTracks()[0];
+      const capabilities = currentTrack.getCapabilities ? currentTrack.getCapabilities() : {};
+      flashBtn.style.display = capabilities.torch ? 'flex' : 'none';
+
+      requestAnimationFrame(tick);
+    } catch (err) {
+      console.error('No se pudo acceder a la cámara:', err);
+      setMessage('No se pudo acceder a la cámara', 'empty');
+      flashBtn.style.display = 'none';
+    }
+  }
+
+  function stopCamera(){
+    scanning = false;
+    const stream = video.srcObject;
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      video.srcObject = null;
+    }
+    currentTrack = null;
+    flashOn = false;
+  }
+
+  function tick(){
+    if (!scanning) return;
+
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: 'dontInvert'
+      });
+
+      if (code) {
+        handleResult(code);
+      }
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  function handleResult(code){
+    // Si no hay QR detectado, no se muestra nada (se mantiene el mensaje por defecto)
+    if (!code || !code.data) return;
+
+    const nombre = code.data.trim();
+
+    if (nombre === '') {
+      setMessage('Sin nombre', 'empty');
+    } else {
+      setMessage(nombre, 'found');
+    }
+
+    lastValue = nombre;
+  }
+
+  function setMessage(text, state){
+    scanText.textContent = text;
+    scanText.classList.remove('found', 'empty');
+    if (state) scanText.classList.add(state);
+  }
+
+  // Iniciar cámara al cargar
+  startCamera();
+</script>
+
+</body>
+</html>
