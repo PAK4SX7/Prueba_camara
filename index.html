@@ -10476,7 +10476,6 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   // ---------------------------------------------------------
   let ocrWorkerPromise = null;
   let ocrBusy = false;
-  let ocrLastKey = null;
 
   function getOcrWorker(){
     if (!ocrWorkerPromise) {
@@ -10509,12 +10508,61 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       .trim();
   }
 
-  function cropBelowQR(imageData, qrBox){
+  function cropBelowQR(imageData, qrBox, location){
     const { width, height } = imageData;
+
+    // Caso ideal: tenemos las 4 esquinas reales del QR (jsQR las da al
+    // decodificar). Las usamos para "enderezar" la franja de texto,
+    // sin importar que la foto esté tomada en ángulo/inclinada — si no
+    // hiciéramos esto, Tesseract recibe el texto torcido y lee basura.
+    if (location) {
+      const bl = location.bottomLeftCorner;
+      const br = location.bottomRightCorner;
+      const tl = location.topLeftCorner;
+
+      let ux = br.x - bl.x, uy = br.y - bl.y;
+      let vx = bl.x - tl.x, vy = bl.y - tl.y;
+      const uLen = Math.hypot(ux, uy);
+      const vLen = Math.hypot(vx, vy);
+      if (uLen < 4 || vLen < 4) return null;
+      ux /= uLen; uy /= uLen;
+      vx /= vLen; vy /= vLen;
+
+      const gap = vLen * 0.05;
+      const stripW = uLen;
+      const stripH = vLen * 0.30;
+      const originX = bl.x + vx * gap;
+      const originY = bl.y + vy * gap;
+
+      const scale = Math.min(6, Math.max(1.5, 220 / stripH));
+      const outW = Math.max(1, Math.round(stripW * scale));
+      const outH = Math.max(1, Math.round(stripH * scale));
+
+      const sourceCanvas = document.createElement('canvas');
+      sourceCanvas.width = width;
+      sourceCanvas.height = height;
+      sourceCanvas.getContext('2d').putImageData(imageData, 0, 0);
+
+      const ocrCanvas = document.createElement('canvas');
+      ocrCanvas.width = outW;
+      ocrCanvas.height = outH;
+      const octx = ocrCanvas.getContext('2d');
+      octx.imageSmoothingEnabled = true;
+      octx.setTransform(
+        ux * scale, vx * scale,
+        uy * scale, vy * scale,
+        -(ux * originX + uy * originY) * scale,
+        -(vx * originX + vy * originY) * scale
+      );
+      octx.drawImage(sourceCanvas, 0, 0);
+      octx.setTransform(1, 0, 0, 1, 0, 0);
+
+      return binarizeCanvas(ocrCanvas);
+    }
+
+    // Sin esquinas (detección por patrón, sin decodificar): recorte
+    // simple asumiendo que la foto está más o menos derecha.
     const qrHeight = qrBox.maxY - qrBox.minY;
-    // Salteamos un margen chico debajo del QR: el borde/quiet-zone del
-    // propio código a veces queda dentro de la caja detectada y el OCR
-    // lo confunde con caracteres (de ahí los símbolos sueltos al inicio).
     const gap = Math.max(2, Math.round(qrHeight * 0.05));
     const top = Math.max(0, Math.round(qrBox.maxY) + gap);
     const bottom = Math.min(height, top + Math.round(qrHeight * 0.30));
@@ -10529,8 +10577,6 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     tempCanvas.height = h;
     tempCanvas.getContext('2d').putImageData(imageData, -left, -top, left, top, w, h);
 
-    // Ampliamos el recorte porque Tesseract lee mucho mejor un texto
-    // grande y nítido que uno diminuto.
     const scale = Math.min(6, Math.max(1, 220 / h));
     const ocrCanvas = document.createElement('canvas');
     ocrCanvas.width = Math.round(w * scale);
@@ -10539,10 +10585,15 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     octx.imageSmoothingEnabled = true;
     octx.drawImage(tempCanvas, 0, 0, ocrCanvas.width, ocrCanvas.height);
 
-    // Binarizamos (blanco/negro puro) para que el OCR no se confunda
-    // con la textura del papel, sombras o el fondo de la foto.
-    const binImageData = octx.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
-    const bd = binImageData.data;
+    return binarizeCanvas(ocrCanvas);
+  }
+
+  // Convierte el recorte a blanco/negro puro para que el OCR no se
+  // confunda con textura de papel, sombras o el fondo de la foto.
+  function binarizeCanvas(canvas){
+    const cctx = canvas.getContext('2d');
+    const imgData = cctx.getImageData(0, 0, canvas.width, canvas.height);
+    const bd = imgData.data;
     let sum = 0;
     for (let i = 0; i < bd.length; i += 4) {
       sum += bd[i] * 0.299 + bd[i + 1] * 0.587 + bd[i + 2] * 0.114;
@@ -10554,15 +10605,14 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       const v = g < threshold ? 0 : 255;
       bd[i] = bd[i + 1] = bd[i + 2] = v;
     }
-    octx.putImageData(binImageData, 0, 0);
-
-    return ocrCanvas;
+    cctx.putImageData(imgData, 0, 0);
+    return canvas;
   }
 
-  async function runOcr(imageData, qrBox, key){
+  async function runOcr(imageData, qrBox, location, key){
     ocrBusy = true;
     try {
-      const ocrCanvas = cropBelowQR(imageData, qrBox);
+      const ocrCanvas = cropBelowQR(imageData, qrBox, location);
       if (!ocrCanvas) {
         ocrBusy = false;
         return;
@@ -10601,7 +10651,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     return 'box:' + Math.round(qrBox.minX / 25) + ',' + Math.round(qrBox.minY / 25) + ',' + Math.round(qrBox.maxX / 25);
   }
 
-  function showTextBelowResult(imageData, qrBox, decoded){
+  function showTextBelowResult(imageData, qrBox, location, decoded){
     if (!imageData || !qrBox) {
       textPreview.classList.remove('visible');
       lastOcrKey = null;
@@ -10611,7 +10661,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     const key = ocrKeyFor(decoded, qrBox);
     textPreview.classList.add('visible');
 
-    if (key === ocrLastKey) {
+    if (key === lastOcrKey) {
       // Ya tenemos (o tuvimos) resultado para esto: no relanzamos OCR.
       return;
     }
@@ -10621,7 +10671,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     textPreviewResult.classList.add('loading');
 
     if (!ocrBusy) {
-      runOcr(imageData, qrBox, key);
+      runOcr(imageData, qrBox, location, key);
     }
   }
 
@@ -10764,7 +10814,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
 
       if (code) {
-        handleResult({ decoded: code.data, box: boxFromLocation(code.location), imageData: lastImageData });
+        handleResult({ decoded: code.data, box: boxFromLocation(code.location), location: code.location, imageData: lastImageData });
         fileInput.value = '';
         return;
       }
@@ -11247,7 +11297,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
           if (code) {
             consecutiveFails = 0;
-            handleResult({ decoded: code.data, box: boxFromLocation(code.location), imageData });
+            handleResult({ decoded: code.data, box: boxFromLocation(code.location), location: code.location, imageData });
           } else {
             const box = detectQRPresence(imageData);
             if (box) {
@@ -11279,7 +11329,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     };
   }
 
-  function handleResult({ decoded, box, imageData }){
+  function handleResult({ decoded, box, location, imageData }){
     // No nos interesa el contenido del QR ni abrir enlaces.
     // Solo confirmamos que hay un QR y si parece tener texto debajo.
 
@@ -11291,16 +11341,16 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       const withText = qrBox ? hasTextBelow(imageData, qrBox) : false;
       setMessage(withText ? '✅ Es un código QR (con un nombre debajo)' : '✅ Es un código QR', 'found');
       if (withText) {
-        showTextBelowResult(imageData, qrBox, decoded);
+        showTextBelowResult(imageData, qrBox, location, decoded);
       } else {
-        showTextBelowResult(null, null, null);
+        showTextBelowResult(null, null, null, null);
       }
       lastValue = 'qr-detectado';
       return;
     }
 
     if (!qrBox) {
-      showTextBelowResult(null, null, null);
+      showTextBelowResult(null, null, null, null);
       return;
     }
 
@@ -11309,10 +11359,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     const withText = hasTextBelow(imageData, qrBox);
     if (withText) {
       setMessage('✅ Es un código QR (con un nombre debajo)', 'found');
-      showTextBelowResult(imageData, qrBox, null);
+      showTextBelowResult(imageData, qrBox, null, null);
     } else {
       setMessage('✅ Es un código QR (sin texto debajo)', 'found');
-      showTextBelowResult(null, null, null);
+      showTextBelowResult(null, null, null, null);
     }
     lastValue = 'qr-detectado-parcial';
   }
