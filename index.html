@@ -104,7 +104,7 @@
     width: min(52.9vw, 420px);
     aspect-ratio: 1 / 1;
     border: none;
-    border-radius: clamp(14px, 2.2vw, 26px);
+    border-radius: clamp(3px, 0.5vw, 6px);
     background: transparent;
     position: relative;
     box-shadow: 0 0 0 9999px rgba(0,0,0,0.9);
@@ -140,6 +140,32 @@
   .scan-text.empty{
     color: rgba(255,255,255,0.55);
     font-style: italic;
+  }
+
+  /* ---------- Vista previa del texto detectado debajo del QR ---------- */
+  .text-preview{
+    display: none;
+    margin-top: 12px;
+    padding: 8px 10px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 10px;
+    max-width: 88vw;
+  }
+  .text-preview.visible{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .text-preview span{
+    color: rgba(255,255,255,0.7);
+    font-size: 11.5px;
+  }
+  .text-preview canvas{
+    image-rendering: pixelated;
+    border-radius: 4px;
+    max-width: 100%;
   }
 
   /* ---------- Botón inferior: Subir imagen ---------- */
@@ -263,6 +289,10 @@
       <div class="scan-line"></div>
     </div>
     <p class="scan-text">Enfoca el código QR dentro del recuadro</p>
+    <div class="text-preview" id="textPreview">
+      <span>Esto es lo que se está leyendo debajo del QR:</span>
+      <canvas id="textPreviewCanvas"></canvas>
+    </div>
   </div>
 
   <!-- Botón encender linterna -->
@@ -10410,6 +10440,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d', { willReadFrequently: true });
   const scanText   = document.querySelector('.scan-text');
+  const textPreview = document.getElementById('textPreview');
+  const textPreviewCanvas = document.getElementById('textPreviewCanvas');
+  const textPreviewCtx = textPreviewCanvas.getContext('2d');
 
   const DEFAULT_MESSAGE = 'Enfoca el código QR dentro del recuadro';
   let scanning = false;
@@ -10418,6 +10451,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   let flashOn = false;
   let errorShown = false;
   let frameCount = 0;
+  let consecutiveFails = 0;
 
   closeBtn.addEventListener('click', () => {
     stopCamera();
@@ -10511,12 +10545,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
     const img = new Image();
     img.onload = () => {
-      // Se intenta a varias resoluciones porque una imagen muy grande
-      // o muy pequeña puede impedir que jsQR ubique los patrones del QR.
-      const attempts = [
-        Math.max(img.width, img.height),
-        2400, 1800, 1400, 1000, 700, 500
-      ];
+      // Pase rápido: un par de resoluciones razonables. Cubre la gran
+      // mayoría de fotos de QR sin demora perceptible.
+      const attempts = [1200, 1600, 900];
 
       let code = null;
       let lastImageData = null;
@@ -10526,22 +10557,25 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         if (result.code) { code = result.code; break; }
       }
 
-      // Si ninguna escala directa funcionó, probamos con realce de
-      // contraste y nitidez (ayuda con fotos borrosas, oscuras o con
-      // reflejos) en las resoluciones más razonables.
+      // Solo si el pase rápido falló probamos realce de contraste y
+      // nitidez (fotos borrosas, oscuras o con reflejos), y a la
+      // resolución original de la imagen (por si es muy grande o muy
+      // chica y las escalas de arriba no calzaron bien).
       if (!code) {
-        for (const dim of [1400, 1000, 1800]) {
-          const result = tryDecodeAtScale(img, dim, true);
-          lastImageData = result.imageData;
-          if (result.code) { code = result.code; break; }
-        }
+        const result = tryDecodeAtScale(img, 1100, true);
+        lastImageData = result.imageData;
+        code = result.code;
+      }
+      if (!code) {
+        const result = tryDecodeAtScale(img, Math.max(img.width, img.height), false);
+        lastImageData = result.imageData;
+        code = result.code;
       }
 
-      // Si el QR es muy pequeño dentro de una foto grande, reducir toda
-      // la imagen borra el detalle necesario. Probamos entonces dividir
-      // la imagen en cuadrantes superpuestos y leer cada uno a mayor
-      // resolución relativa.
-      if (!code && Math.max(img.width, img.height) > 1400) {
+      // Último recurso, y el más lento: si el QR es muy pequeño dentro
+      // de una foto grande, dividimos en 4 cuadrantes superpuestos y
+      // leemos cada uno a mayor resolución relativa.
+      if (!code && Math.max(img.width, img.height) > 2200) {
         const overlap = 0.15;
         const stepW = img.width * (0.5 + overlap);
         const stepH = img.height * (0.5 + overlap);
@@ -10558,7 +10592,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
 
       if (code) {
-        handleResult({ decoded: code.data, box: null, imageData: lastImageData });
+        handleResult({ decoded: code.data, box: boxFromLocation(code.location), imageData: lastImageData });
         fileInput.value = '';
         return;
       }
@@ -10948,43 +10982,49 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         const rect = getViewfinderSourceRect();
 
         if (rect) {
-          // Intento principal: recorte del visor a buena resolución.
-          // Ayuda con QR lejanos o pequeños porque los amplía digitalmente.
-          let imageData = captureRect(rect, 1400);
+          // Intento principal: recorte del visor. Este es el único
+          // intento en el caso normal, para que la lectura sea
+          // instantánea con un QR de buena calidad.
+          let imageData = captureRect(rect, 1000);
           let code = jsQR(imageData.data, imageData.width, imageData.height, {
             inversionAttempts: 'attemptBoth'
           });
 
-          // Si falla, probamos con realce de contraste/nitidez sobre el
-          // mismo recorte (ayuda con fotos borrosas o con poca luz),
-          // pero solo cada pocos frames para no afectar el rendimiento.
-          if (!code && frameCount % 2 === 0) {
-            const enhanced = decodeWithFallbacks(imageData);
-            if (enhanced.code) {
-              code = enhanced.code;
-              imageData = enhanced.imageData;
-            }
-          }
+          if (code) {
+            consecutiveFails = 0;
+          } else {
+            consecutiveFails++;
 
-          // Si sigue sin encontrarse, probamos el frame completo de la
-          // cámara (no solo el recuadro): cubre el caso de un QR más
-          // grande que el visor (muy cerca) o mal centrado.
-          if (!code && frameCount % 3 === 0) {
-            const fullRect = getFullFrameSourceRect();
-            if (fullRect) {
-              const fullImageData = captureRect(fullRect, 1200);
-              const fullCode = jsQR(fullImageData.data, fullImageData.width, fullImageData.height, {
-                inversionAttempts: 'attemptBoth'
-              });
-              if (fullCode) {
-                code = fullCode;
-                imageData = fullImageData;
+            // Si lleva varios frames sin leer (foto/QR difícil), recién
+            // ahí probamos realce de contraste/nitidez sobre el recorte.
+            if (consecutiveFails >= 5) {
+              const enhanced = decodeWithFallbacks(imageData);
+              if (enhanced.code) {
+                code = enhanced.code;
+                imageData = enhanced.imageData;
+              }
+            }
+
+            // Si sigue sin leer tras más intentos, probamos el frame
+            // completo (QR más grande que el visor o mal centrado).
+            if (!code && consecutiveFails >= 10) {
+              const fullRect = getFullFrameSourceRect();
+              if (fullRect) {
+                const fullImageData = captureRect(fullRect, 1000);
+                const fullCode = jsQR(fullImageData.data, fullImageData.width, fullImageData.height, {
+                  inversionAttempts: 'attemptBoth'
+                });
+                if (fullCode) {
+                  code = fullCode;
+                  imageData = fullImageData;
+                }
               }
             }
           }
 
           if (code) {
-            handleResult({ decoded: code.data, box: null, imageData });
+            consecutiveFails = 0;
+            handleResult({ decoded: code.data, box: boxFromLocation(code.location), imageData });
           } else {
             const box = detectQRPresence(imageData);
             if (box) {
@@ -11004,6 +11044,18 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
   }
 
+  function boxFromLocation(location){
+    if (!location) return null;
+    const xs = [location.topLeftCorner.x, location.topRightCorner.x, location.bottomLeftCorner.x, location.bottomRightCorner.x];
+    const ys = [location.topLeftCorner.y, location.topRightCorner.y, location.bottomLeftCorner.y, location.bottomRightCorner.y];
+    return {
+      minX: Math.min(...xs),
+      minY: Math.min(...ys),
+      maxX: Math.max(...xs),
+      maxY: Math.max(...ys)
+    };
+  }
+
   function handleResult({ decoded, box, imageData }){
     // No nos interesa el contenido del QR ni abrir enlaces.
     // Solo confirmamos que hay un QR y si parece tener texto debajo.
@@ -11013,12 +11065,17 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     if (decoded !== null && decoded !== undefined) {
       // jsQR sí pudo leer el contenido completo: ya sabemos que es un QR válido.
       // No mostramos el contenido decodificado, solo la confirmación.
-      setMessage('✅ Es un código QR', 'found');
+      const withText = qrBox ? hasTextBelow(imageData, qrBox) : false;
+      setMessage(withText ? '✅ Es un código QR (con un nombre debajo)' : '✅ Es un código QR', 'found');
+      updateTextPreview(withText ? imageData : null, qrBox);
       lastValue = 'qr-detectado';
       return;
     }
 
-    if (!qrBox) return;
+    if (!qrBox) {
+      updateTextPreview(null, null);
+      return;
+    }
 
     // QR detectado por patrón (aunque no se pudo decodificar el contenido,
     // por ejemplo si está parcialmente dañado o manchado).
@@ -11028,7 +11085,45 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     } else {
       setMessage('✅ Es un código QR (sin texto debajo)', 'found');
     }
+    updateTextPreview(withText ? imageData : null, qrBox);
     lastValue = 'qr-detectado-parcial';
+  }
+
+  // Muestra un recorte ampliado de la franja debajo del QR, para que se
+  // pueda comprobar a simple vista que la app realmente está "viendo"
+  // ese texto y no lo está inventando. No es reconocimiento de texto
+  // (OCR): eso requeriría una librería pesada que metería demora.
+  function updateTextPreview(imageData, qrBox){
+    if (!imageData || !qrBox) {
+      textPreview.classList.remove('visible');
+      return;
+    }
+
+    const { data, width, height } = imageData;
+    const top = Math.max(0, Math.round(qrBox.maxY));
+    const bottom = Math.min(height, top + Math.round((qrBox.maxY - qrBox.minY) * 0.35));
+    const left = Math.max(0, Math.round(qrBox.minX));
+    const right = Math.min(width, Math.round(qrBox.maxX));
+    const w = right - left;
+    const h = bottom - top;
+    if (w <= 0 || h <= 0) {
+      textPreview.classList.remove('visible');
+      return;
+    }
+
+    // Recortamos la franja y la ampliamos para que se lea con claridad.
+    const cropCanvas = document.createElement('canvas');
+    cropCanvas.width = w;
+    cropCanvas.height = h;
+    cropCanvas.getContext('2d').putImageData(imageData, -left, -top, left, top, w, h);
+
+    const zoom = Math.min(4, Math.max(1, 260 / w));
+    textPreviewCanvas.width = Math.round(w * zoom);
+    textPreviewCanvas.height = Math.round(h * zoom);
+    textPreviewCtx.imageSmoothingEnabled = true;
+    textPreviewCtx.drawImage(cropCanvas, 0, 0, textPreviewCanvas.width, textPreviewCanvas.height);
+
+    textPreview.classList.add('visible');
   }
 
   function setMessage(text, state){
