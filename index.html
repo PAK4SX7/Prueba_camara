@@ -10417,6 +10417,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   let currentTrack = null;
   let flashOn = false;
   let errorShown = false;
+  let frameCount = 0;
 
   closeBtn.addEventListener('click', () => {
     stopCamera();
@@ -10461,7 +10462,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     setTimeout(() => { label.textContent = original; }, 2400);
   }
 
-  function tryDecodeAtScale(img, targetMaxDim){
+  function tryDecodeAtScale(img, targetMaxDim, useFallbacks){
     const scale = Math.min(1, targetMaxDim / Math.max(img.width, img.height));
     const w = Math.max(1, Math.round(img.width * scale));
     const h = Math.max(1, Math.round(img.height * scale));
@@ -10469,7 +10470,33 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     canvas.height = h;
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
-    const imageData = ctx.getImageData(0, 0, w, h);
+    let imageData = ctx.getImageData(0, 0, w, h);
+    let code = jsQR(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts: 'attemptBoth'
+    });
+    if (!code && useFallbacks) {
+      const result = decodeWithFallbacks(imageData);
+      code = result.code;
+      if (code) imageData = result.imageData;
+    }
+    return { code, imageData };
+  }
+
+  // Recorta un rectángulo (region) de la imagen original a su resolución
+  // real y trata de decodificar ahí. Sirve para encontrar un QR muy
+  // pequeño dentro de una foto grande, donde reducir la imagen completa
+  // perdería el detalle necesario para leerlo.
+  function tryDecodeRegion(img, rx, ry, rw, rh, targetMaxDim){
+    const w = Math.max(1, Math.round(rw));
+    const h = Math.max(1, Math.round(rh));
+    const scale = Math.min(1, targetMaxDim / Math.max(w, h));
+    const outW = Math.max(1, Math.round(w * scale));
+    const outH = Math.max(1, Math.round(h * scale));
+    canvas.width = outW;
+    canvas.height = outH;
+    ctx.clearRect(0, 0, outW, outH);
+    ctx.drawImage(img, rx, ry, w, h, 0, 0, outW, outH);
+    const imageData = ctx.getImageData(0, 0, outW, outH);
     const code = jsQR(imageData.data, imageData.width, imageData.height, {
       inversionAttempts: 'attemptBoth'
     });
@@ -10488,15 +10515,46 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       // o muy pequeña puede impedir que jsQR ubique los patrones del QR.
       const attempts = [
         Math.max(img.width, img.height),
-        1600, 1000, 700, 2400
+        2400, 1800, 1400, 1000, 700, 500
       ];
 
       let code = null;
       let lastImageData = null;
       for (const dim of attempts) {
-        const result = tryDecodeAtScale(img, dim);
+        const result = tryDecodeAtScale(img, dim, false);
         lastImageData = result.imageData;
         if (result.code) { code = result.code; break; }
+      }
+
+      // Si ninguna escala directa funcionó, probamos con realce de
+      // contraste y nitidez (ayuda con fotos borrosas, oscuras o con
+      // reflejos) en las resoluciones más razonables.
+      if (!code) {
+        for (const dim of [1400, 1000, 1800]) {
+          const result = tryDecodeAtScale(img, dim, true);
+          lastImageData = result.imageData;
+          if (result.code) { code = result.code; break; }
+        }
+      }
+
+      // Si el QR es muy pequeño dentro de una foto grande, reducir toda
+      // la imagen borra el detalle necesario. Probamos entonces dividir
+      // la imagen en cuadrantes superpuestos y leer cada uno a mayor
+      // resolución relativa.
+      if (!code && Math.max(img.width, img.height) > 1400) {
+        const overlap = 0.15;
+        const stepW = img.width * (0.5 + overlap);
+        const stepH = img.height * (0.5 + overlap);
+        const regions = [
+          [0, 0, stepW, stepH],
+          [img.width - stepW, 0, stepW, stepH],
+          [0, img.height - stepH, stepW, stepH],
+          [img.width - stepW, img.height - stepH, stepW, stepH]
+        ];
+        for (const [rx, ry, rw, rh] of regions) {
+          const result = tryDecodeRegion(img, Math.max(0, rx), Math.max(0, ry), rw, rh, 1400);
+          if (result.code) { code = result.code; lastImageData = result.imageData; break; }
+        }
       }
 
       if (code) {
@@ -10507,11 +10565,26 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
       // jsQR no pudo decodificar el contenido; probamos detección de
       // presencia (solo patrón visual) a un tamaño manejable.
-      const presenceResult = tryDecodeAtScale(img, 1200);
-      const box = detectQRPresence(presenceResult.imageData);
+      const presenceResult = tryDecodeAtScale(img, 1200, false);
+      let box = detectQRPresence(presenceResult.imageData);
+      let presenceImageData = presenceResult.imageData;
+
+      if (!box) {
+        // Último intento con la imagen realzada, por si el patrón
+        // visual está muy tenue (foto borrosa o con poco contraste).
+        const contrasted = autoContrastImageData(presenceResult.imageData);
+        box = detectQRPresence(contrasted);
+        if (box) {
+          presenceImageData = contrasted;
+        } else {
+          const sharpened = sharpenImageData(presenceResult.imageData);
+          box = detectQRPresence(sharpened);
+          if (box) presenceImageData = sharpened;
+        }
+      }
 
       if (box) {
-        handleResult({ decoded: null, box, imageData: presenceResult.imageData });
+        handleResult({ decoded: null, box, imageData: presenceImageData });
       } else {
         setMessage('No se detectó ningún QR en la imagen. Prueba con una foto más nítida, bien enfocada y de frente.', 'empty');
       }
@@ -10555,6 +10628,96 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
     currentTrack = null;
     flashOn = false;
+  }
+
+  // ---------------------------------------------------------
+  // Realza bordes (unsharp mask ligero) para ayudar a jsQR con
+  // fotos borrosas o con poco enfoque. Trabaja en escala de grises
+  // y devuelve un ImageData RGBA nuevo listo para jsQR.
+  // ---------------------------------------------------------
+  function sharpenImageData(imageData){
+    const { data, width, height } = imageData;
+    const gray = new Float32Array(width * height);
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+      gray[p] = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+    }
+
+    const out = new Uint8ClampedArray(data.length);
+    const amount = 1.6; // fuerza del realce
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        let v;
+        if (x === 0 || y === 0 || x === width - 1 || y === height - 1) {
+          v = gray[idx];
+        } else {
+          const center = gray[idx];
+          const blur = (
+            gray[idx - 1] + gray[idx + 1] +
+            gray[idx - width] + gray[idx + width] +
+            center * 4
+          ) / 8;
+          v = center + (center - blur) * amount;
+        }
+        const o = idx * 4;
+        const g = v < 0 ? 0 : (v > 255 ? 255 : v);
+        out[o] = out[o + 1] = out[o + 2] = g;
+        out[o + 3] = 255;
+      }
+    }
+    return new ImageData(out, width, height);
+  }
+
+  // Estira el contraste (normalización min-max) para imágenes
+  // apagadas, con poca luz o con reflejos suaves.
+  function autoContrastImageData(imageData){
+    const { data, width, height } = imageData;
+    let min = 255, max = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const g = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+      if (g < min) min = g;
+      if (g > max) max = g;
+    }
+    const range = max - min;
+    if (range < 20) return imageData; // ya tiene contraste suficiente o es plana
+
+    const out = new Uint8ClampedArray(data.length);
+    const scale = 255 / range;
+    for (let i = 0; i < data.length; i += 4) {
+      const g = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+      const v = (g - min) * scale;
+      out[i] = out[i + 1] = out[i + 2] = v;
+      out[i + 3] = 255;
+    }
+    return new ImageData(out, width, height);
+  }
+
+  function decodeWithFallbacks(imageData){
+    let code = jsQR(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts: 'attemptBoth'
+    });
+    if (code) return { code, imageData };
+
+    const contrasted = autoContrastImageData(imageData);
+    code = jsQR(contrasted.data, contrasted.width, contrasted.height, {
+      inversionAttempts: 'attemptBoth'
+    });
+    if (code) return { code, imageData: contrasted };
+
+    const sharpened = sharpenImageData(imageData);
+    code = jsQR(sharpened.data, sharpened.width, sharpened.height, {
+      inversionAttempts: 'attemptBoth'
+    });
+    if (code) return { code, imageData: sharpened };
+
+    return { code: null, imageData };
+  }
+
+  function getFullFrameSourceRect(){
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    return { sx: 0, sy: 0, sw: vw, sh: vh };
   }
 
   function getViewfinderSourceRect(){
@@ -10606,7 +10769,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
 
     const centers = [];
-    const step = Math.max(1, Math.floor(height / 220)); // muestreo de filas
+    const step = Math.max(1, Math.floor(height / 320)); // muestreo de filas (más fino para patrones pequeños/lejanos)
 
     for (let y = 0; y < height; y += step) {
       let runs = [];
@@ -10625,13 +10788,13 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
             // patrón candidato: blanco,negro,blanco,negro,blanco con negro central grueso
             const total = runs.reduce((a, b) => a + b, 0);
             const unit = total / 7;
-            const tol = unit * 0.55;
+            const tol = unit * 0.65;
             const expected = [1, 1, 3, 1, 1];
             let ok = true;
             for (let k = 0; k < 5; k++) {
               if (Math.abs(runs[k] - expected[k] * unit) > tol) { ok = false; break; }
             }
-            if (ok && unit > 1.2) {
+            if (ok && unit > 0.8) {
               const cx = x - runs[4] - runs[3] - runs[2] / 2;
               centers.push({ x: cx, y, unit });
             }
@@ -10661,7 +10824,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       if (!placed) clusters.push([c]);
     }
     return clusters
-      .filter(cl => cl.length >= 3) // un finder pattern real aparece en varias filas
+      .filter(cl => cl.length >= 2) // un finder pattern real aparece en varias filas (2+ para patrones pequeños/lejanos)
       .map(cl => {
         const n = cl.length;
         const x = cl.reduce((a, p) => a + p.x, 0) / n;
@@ -10682,7 +10845,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
 
     const rawCenters = findFinderPatternCenters(gray, width, height);
-    const clusters = clusterCenters(rawCenters, 1.4);
+    const clusters = clusterCenters(rawCenters, 1.6);
 
     if (clusters.length < 3) return null;
 
@@ -10760,6 +10923,18 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     return darkRatio > 0.015 && darkRatio < 0.4;
   }
 
+  function captureRect(rect, maxDim){
+    const outScale = Math.min(1, maxDim / Math.max(rect.sw, rect.sh));
+    canvas.width = Math.max(1, Math.round(rect.sw * outScale));
+    canvas.height = Math.max(1, Math.round(rect.sh * outScale));
+    ctx.drawImage(
+      video,
+      rect.sx, rect.sy, rect.sw, rect.sh,
+      0, 0, canvas.width, canvas.height
+    );
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }
+
   function tick(){
     if (!scanning) return;
 
@@ -10769,24 +10944,44 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
 
       if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
+        frameCount++;
         const rect = getViewfinderSourceRect();
 
         if (rect) {
-          const MAX_DIM = 1000;
-          const outScale = Math.min(1, MAX_DIM / Math.max(rect.sw, rect.sh));
-          canvas.width = Math.max(1, Math.round(rect.sw * outScale));
-          canvas.height = Math.max(1, Math.round(rect.sh * outScale));
-
-          ctx.drawImage(
-            video,
-            rect.sx, rect.sy, rect.sw, rect.sh,
-            0, 0, canvas.width, canvas.height
-          );
-
-          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          const code = jsQR(imageData.data, imageData.width, imageData.height, {
+          // Intento principal: recorte del visor a buena resolución.
+          // Ayuda con QR lejanos o pequeños porque los amplía digitalmente.
+          let imageData = captureRect(rect, 1400);
+          let code = jsQR(imageData.data, imageData.width, imageData.height, {
             inversionAttempts: 'attemptBoth'
           });
+
+          // Si falla, probamos con realce de contraste/nitidez sobre el
+          // mismo recorte (ayuda con fotos borrosas o con poca luz),
+          // pero solo cada pocos frames para no afectar el rendimiento.
+          if (!code && frameCount % 2 === 0) {
+            const enhanced = decodeWithFallbacks(imageData);
+            if (enhanced.code) {
+              code = enhanced.code;
+              imageData = enhanced.imageData;
+            }
+          }
+
+          // Si sigue sin encontrarse, probamos el frame completo de la
+          // cámara (no solo el recuadro): cubre el caso de un QR más
+          // grande que el visor (muy cerca) o mal centrado.
+          if (!code && frameCount % 3 === 0) {
+            const fullRect = getFullFrameSourceRect();
+            if (fullRect) {
+              const fullImageData = captureRect(fullRect, 1200);
+              const fullCode = jsQR(fullImageData.data, fullImageData.width, fullImageData.height, {
+                inversionAttempts: 'attemptBoth'
+              });
+              if (fullCode) {
+                code = fullCode;
+                imageData = fullImageData;
+              }
+            }
+          }
 
           if (code) {
             handleResult({ decoded: code.data, box: null, imageData });
