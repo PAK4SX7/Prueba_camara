@@ -406,7 +406,17 @@ return /******/ (function(modules) { // webpackBootstrap
 /******/ 	__webpack_require__.p = "";
 /******/
 /******/ 	// Load entry module and return exports
-/******/ 	return __webpack_require__(__webpack_require__.s = 3);
+/******/ 	var __entry = __webpack_require__(__webpack_require__.s = 3);
+/******/ 	// Además de jsQR(...) (que decodifica), exponemos las piezas
+/******/ 	// internas que usa para UBICAR el patrón del QR (binarize +
+/******/ 	// locate). Esto nos deja confirmar "hay un QR" con el mismo
+/******/ 	// algoritmo robusto real, incluso si el contenido no se puede
+/******/ 	// decodificar (por ejemplo, un QR dañado o estilizado).
+/******/ 	if (__entry && __entry.default) {
+/******/ 		try { __entry.default.__binarize = __webpack_require__(4).binarize; } catch(e){}
+/******/ 		try { __entry.default.__locate = __webpack_require__(12).locate; } catch(e){}
+/******/ 	}
+/******/ 	return __entry;
 /******/ })
 /************************************************************************/
 /******/ ([
@@ -10819,14 +10829,15 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         return;
       }
 
-      // jsQR no pudo decodificar ningún QR real en la imagen, con
-      // ninguno de los intentos anteriores. Antes había acá un
-      // "modo detección de patrón" que adivinaba si había un QR sin
-      // poder leerlo, pero eso terminaba marcando como QR fotos que
-      // no tenían ninguno (texturas, teclados, fondos oscuros...).
-      // Mejor ser honestos: si jsQR no lo puede leer, no confirmamos
-      // que haya un QR.
-      setMessage('No se detectó ningún QR en la imagen. Prueba con una foto más nítida, bien enfocada y de frente.', 'empty');
+      // jsQR no pudo leer el contenido (puede estar dañado o ser un QR
+      // "estilizado" a propósito). Antes de rendirnos, confirmamos con
+      // su propio localizador real si de verdad hay un QR ahí.
+      const loc = locateQRPattern(lastImageData);
+      if (loc) {
+        handleResult({ decoded: null, box: boxFromLocation(loc), location: loc, imageData: lastImageData });
+      } else {
+        setMessage('No se detectó ningún QR en la imagen. Prueba con una foto más nítida, bien enfocada y de frente.', 'empty');
+      }
       fileInput.value = '';
     };
     img.onerror = () => {
@@ -11099,11 +11110,17 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
             consecutiveFails = 0;
             handleResult({ decoded: code.data, box: boxFromLocation(code.location), location: code.location, imageData });
           } else {
-            // Ya no "adivinamos" si hay un QR sin poder leerlo: esa
-            // heurística terminaba detectando QR en teclados, sombras
-            // y fondos oscuros que no tenían ninguno. Si jsQR no lo
-            // puede decodificar de verdad, seguimos esperando.
-            if (consecutiveFails === 3 && lastValue !== null) {
+            // No pudimos leer el contenido. Tras varios frames seguidos
+            // así (para no gastar de más en cada frame), confirmamos con
+            // el localizador real de jsQR si de verdad hay un QR ahí
+            // (aunque esté dañado/estilizado y no se pueda decodificar).
+            let loc = null;
+            if (consecutiveFails >= 6) {
+              loc = locateQRPattern(imageData);
+            }
+            if (loc) {
+              handleResult({ decoded: null, box: boxFromLocation(loc), location: loc, imageData });
+            } else if (consecutiveFails === 3 && lastValue !== null) {
               setMessage(DEFAULT_MESSAGE, 'empty');
               showTextBelowResult(null, null, null, null);
               lastValue = null;
@@ -11119,6 +11136,55 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
     } finally {
       requestAnimationFrame(tick);
+    }
+  }
+
+  // Un candidato real de QR tiene sus 3 esquinas formando un cuadrado
+  // (lados de largo parecido, en ángulo recto). El localizador de jsQR
+  // es solo un primer filtro permisivo (a propósito, para no perderse
+  // QRs raros) y por sí solo puede "encontrar" cosas hasta en ruido
+  // puro — esta verificación geométrica es la que realmente confirma
+  // que es un QR y no una coincidencia cualquiera.
+  function passesSquareGeometry(tl, tr, bl){
+    const ux = tr.x - tl.x, uy = tr.y - tl.y;
+    const vx = bl.x - tl.x, vy = bl.y - tl.y;
+    const uLen = Math.hypot(ux, uy), vLen = Math.hypot(vx, vy);
+    if (uLen < 8 || vLen < 8) return false;
+    const ratio = Math.min(uLen, vLen) / Math.max(uLen, vLen);
+    const cosAngle = (ux * vx + uy * vy) / (uLen * vLen);
+    return ratio > 0.55 && Math.abs(cosAngle) < 0.35;
+  }
+
+  // Usa el localizador REAL de jsQR (el mismo algoritmo que usa para
+  // encontrar el QR antes de intentar leerlo) para confirmar que hay
+  // un QR, aunque su contenido esté dañado y no se pueda decodificar.
+  function locateQRPattern(imageData){
+    if (typeof jsQR !== 'function' || !jsQR.__binarize || !jsQR.__locate) return null;
+    try {
+      const { binarized, inverted } = jsQR.__binarize(imageData.data, imageData.width, imageData.height, true);
+      const candidateLists = [jsQR.__locate(binarized), jsQR.__locate(inverted)];
+
+      for (const locations of candidateLists) {
+        if (!locations || !locations.length) continue;
+        for (const loc of locations) {
+          const tl = loc.topLeft, tr = loc.topRight, bl = loc.bottomLeft;
+          if (!tl || !tr || !bl) continue;
+          if (!passesSquareGeometry(tl, tr, bl)) continue;
+
+          // Aproximamos la 4ta esquina asumiendo un paralelogramo (buena
+          // aproximación salvo perspectivas muy extremas).
+          const br = { x: tr.x + bl.x - tl.x, y: tr.y + bl.y - tl.y };
+          return {
+            topLeftCorner: tl,
+            topRightCorner: tr,
+            bottomLeftCorner: bl,
+            bottomRightCorner: br
+          };
+        }
+      }
+      return null;
+    } catch (err) {
+      return null;
     }
   }
 
