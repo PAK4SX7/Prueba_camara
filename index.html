@@ -10470,9 +10470,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
     const imageData = ctx.getImageData(0, 0, w, h);
-    return jsQR(imageData.data, imageData.width, imageData.height, {
+    const code = jsQR(imageData.data, imageData.width, imageData.height, {
       inversionAttempts: 'attemptBoth'
     });
+    return { code, imageData };
   }
 
   fileInput.addEventListener('change', (e) => {
@@ -10491,18 +10492,29 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       ];
 
       let code = null;
+      let lastImageData = null;
       for (const dim of attempts) {
-        code = tryDecodeAtScale(img, dim);
-        if (code) break;
+        const result = tryDecodeAtScale(img, dim);
+        lastImageData = result.imageData;
+        if (result.code) { code = result.code; break; }
       }
 
-      if (!code) {
-        setMessage('No se detectó ningún QR en la imagen. Prueba con una foto más nítida, bien enfocada y de frente.', 'empty');
+      if (code) {
+        handleResult({ decoded: code.data, box: null, imageData: lastImageData });
         fileInput.value = '';
         return;
       }
 
-      handleResult(code);
+      // jsQR no pudo decodificar el contenido; probamos detección de
+      // presencia (solo patrón visual) a un tamaño manejable.
+      const presenceResult = tryDecodeAtScale(img, 1200);
+      const box = detectQRPresence(presenceResult.imageData);
+
+      if (box) {
+        handleResult({ decoded: null, box, imageData: presenceResult.imageData });
+      } else {
+        setMessage('No se detectó ningún QR en la imagen. Prueba con una foto más nítida, bien enfocada y de frente.', 'empty');
+      }
       fileInput.value = '';
     };
     img.onerror = () => {
@@ -10577,6 +10589,177 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     return { sx, sy, sw, sh };
   }
 
+  // ---------------------------------------------------------
+  // Detección de "presencia de QR" sin decodificar contenido.
+  // Busca el patrón característico 1:1:3:1:1 (los 3 cuadros de
+  // esquina de todo código QR). Esto funciona incluso si el QR
+  // está dañado en el centro y jsQR no logra leer los datos.
+  // ---------------------------------------------------------
+  function findFinderPatternCenters(gray, width, height){
+    // Binariza usando un umbral simple (Otsu aproximado por media)
+    let sum = 0;
+    for (let i = 0; i < gray.length; i++) sum += gray[i];
+    const mean = sum / gray.length;
+
+    function isDark(x, y){
+      return gray[y * width + x] < mean * 0.85;
+    }
+
+    const centers = [];
+    const step = Math.max(1, Math.floor(height / 220)); // muestreo de filas
+
+    for (let y = 0; y < height; y += step) {
+      let runs = [];
+      let currentColor = isDark(0, y);
+      let count = 1;
+
+      for (let x = 1; x < width; x++) {
+        const dark = isDark(x, y);
+        if (dark === currentColor) {
+          count++;
+        } else {
+          runs.push(count);
+          if (runs.length > 5) runs.shift();
+
+          if (runs.length === 5 && currentColor === true) {
+            // patrón candidato: blanco,negro,blanco,negro,blanco con negro central grueso
+            const total = runs.reduce((a, b) => a + b, 0);
+            const unit = total / 7;
+            const tol = unit * 0.55;
+            const expected = [1, 1, 3, 1, 1];
+            let ok = true;
+            for (let k = 0; k < 5; k++) {
+              if (Math.abs(runs[k] - expected[k] * unit) > tol) { ok = false; break; }
+            }
+            if (ok && unit > 1.2) {
+              const cx = x - runs[4] - runs[3] - runs[2] / 2;
+              centers.push({ x: cx, y, unit });
+            }
+          }
+          currentColor = dark;
+          count = 1;
+        }
+      }
+    }
+    return centers;
+  }
+
+  function clusterCenters(centers, distanceFactor){
+    // Agrupa detecciones cercanas (varias filas detectan el mismo cuadro)
+    const clusters = [];
+    for (const c of centers) {
+      let placed = false;
+      for (const cluster of clusters) {
+        const ref = cluster[0];
+        const maxDist = Math.max(ref.unit, c.unit) * distanceFactor;
+        if (Math.abs(ref.x - c.x) < maxDist && Math.abs(ref.y - c.y) < maxDist) {
+          cluster.push(c);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) clusters.push([c]);
+    }
+    return clusters
+      .filter(cl => cl.length >= 3) // un finder pattern real aparece en varias filas
+      .map(cl => {
+        const n = cl.length;
+        const x = cl.reduce((a, p) => a + p.x, 0) / n;
+        const y = cl.reduce((a, p) => a + p.y, 0) / n;
+        const unit = cl.reduce((a, p) => a + p.unit, 0) / n;
+        return { x, y, unit, votes: n };
+      });
+  }
+
+  // Detecta si hay un QR presente (3 esquinas con patrón 1:1:3:1:1),
+  // aunque no se pueda leer su contenido. Devuelve la caja aproximada
+  // del código o null si no encuentra evidencia suficiente.
+  function detectQRPresence(imageData){
+    const { data, width, height } = imageData;
+    const gray = new Uint8ClampedArray(width * height);
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+      gray[p] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
+    }
+
+    const rawCenters = findFinderPatternCenters(gray, width, height);
+    const clusters = clusterCenters(rawCenters, 1.4);
+
+    if (clusters.length < 3) return null;
+
+    // Elegir las 3 agrupaciones con más votos (más confiables)
+    clusters.sort((a, b) => b.votes - a.votes);
+    const top = clusters.slice(0, Math.min(6, clusters.length));
+
+    // Verificar que al menos 3 de ellas formen una distribución
+    // razonable en forma de "L" (no colineales, tamaños similares)
+    for (let i = 0; i < top.length; i++) {
+      for (let j = i + 1; j < top.length; j++) {
+        for (let k = j + 1; k < top.length; k++) {
+          const a = top[i], b = top[j], c = top[k];
+          const sizes = [a.unit, b.unit, c.unit];
+          const avgSize = sizes.reduce((x, y) => x + y, 0) / 3;
+          const sizeOk = sizes.every(s => Math.abs(s - avgSize) < avgSize * 0.6);
+          if (!sizeOk) continue;
+
+          // Área del triángulo formado (para descartar puntos casi colineales)
+          const area = Math.abs(
+            (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)
+          ) / 2;
+          const minSeparation = avgSize * 4;
+          if (area > minSeparation * minSeparation * 0.3) {
+            const xs = [a.x, b.x, c.x];
+            const ys = [a.y, b.y, c.y];
+            return {
+              minX: Math.min(...xs) - avgSize * 3,
+              minY: Math.min(...ys) - avgSize * 3,
+              maxX: Math.max(...xs) + avgSize * 3,
+              maxY: Math.max(...ys) + avgSize * 3
+            };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  // Revisa si hay texto/marcas oscuras debajo del área del QR
+  // (heurística simple: densidad de píxeles oscuros en la franja inferior)
+  function hasTextBelow(imageData, qrBox){
+    const { data, width, height } = imageData;
+    const top = Math.max(0, Math.round(qrBox.maxY));
+    const bottom = Math.min(height, top + Math.round((qrBox.maxY - qrBox.minY) * 0.35));
+    const left = Math.max(0, Math.round(qrBox.minX));
+    const right = Math.min(width, Math.round(qrBox.maxX));
+
+    if (bottom <= top || right <= left) return false;
+
+    // Umbral de brillo local de esa franja
+    let sum = 0, n = 0;
+    for (let y = top; y < bottom; y++) {
+      for (let x = left; x < right; x++) {
+        const i = (y * width + x) * 4;
+        sum += data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114;
+        n++;
+      }
+    }
+    if (n === 0) return false;
+    const mean = sum / n;
+    const threshold = mean * 0.7;
+
+    let darkCount = 0;
+    for (let y = top; y < bottom; y++) {
+      for (let x = left; x < right; x++) {
+        const i = (y * width + x) * 4;
+        const gray = data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114;
+        if (gray < threshold) darkCount++;
+      }
+    }
+    const darkRatio = darkCount / n;
+    // Texto normal ocupa entre ~2% y ~35% de píxeles oscuros en su franja;
+    // muy poco (ruido) o casi todo (mancha/objeto) se descarta.
+    return darkRatio > 0.015 && darkRatio < 0.4;
+  }
+
   function tick(){
     if (!scanning) return;
 
@@ -10606,7 +10789,12 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
           });
 
           if (code) {
-            handleResult(code);
+            handleResult({ decoded: code.data, box: null, imageData });
+          } else {
+            const box = detectQRPresence(imageData);
+            if (box) {
+              handleResult({ decoded: null, box, imageData });
+            }
           }
         }
       }
@@ -10621,19 +10809,31 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
   }
 
-  function handleResult(code){
-    // Si no hay QR detectado, no se muestra nada (se mantiene el mensaje por defecto)
-    if (!code || !code.data) return;
+  function handleResult({ decoded, box, imageData }){
+    // No nos interesa el contenido del QR ni abrir enlaces.
+    // Solo confirmamos que hay un QR y si parece tener texto debajo.
 
-    const nombre = code.data.trim();
+    let qrBox = box;
 
-    if (nombre === '') {
-      setMessage('Sin nombre', 'empty');
-    } else {
-      setMessage(nombre, 'found');
+    if (decoded !== null && decoded !== undefined) {
+      // jsQR sí pudo leer el contenido completo: ya sabemos que es un QR válido.
+      // No mostramos el contenido decodificado, solo la confirmación.
+      setMessage('✅ Es un código QR', 'found');
+      lastValue = 'qr-detectado';
+      return;
     }
 
-    lastValue = nombre;
+    if (!qrBox) return;
+
+    // QR detectado por patrón (aunque no se pudo decodificar el contenido,
+    // por ejemplo si está parcialmente dañado o manchado).
+    const withText = hasTextBelow(imageData, qrBox);
+    if (withText) {
+      setMessage('✅ Es un código QR (con un nombre debajo)', 'found');
+    } else {
+      setMessage('✅ Es un código QR (sin texto debajo)', 'found');
+    }
+    lastValue = 'qr-detectado-parcial';
   }
 
   function setMessage(text, state){
