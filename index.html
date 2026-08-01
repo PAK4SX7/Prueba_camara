@@ -11,6 +11,8 @@
     --light-purple: #C08FE0;
     --border-gray: rgba(255,255,255,0.4);
     --ghost-bg: rgba(255,255,255,0.08);
+    --upload-bottom: max(3.6vh, calc(env(safe-area-inset-bottom) + 18px));
+    --upload-height: clamp(50px, 6.2vh, 74px);
   }
 
   *{
@@ -144,8 +146,6 @@
   .upload-btn{
     position: absolute;
     left: 50%;
-    --upload-bottom: max(3.6vh, calc(env(safe-area-inset-bottom) + 18px));
-    --upload-height: clamp(50px, 6.2vh, 74px);
     bottom: var(--upload-bottom);
     transform: translateX(-50%);
     width: min(88vw, 560px);
@@ -10415,6 +10415,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   let lastValue = null;
   let currentTrack = null;
   let flashOn = false;
+  let errorShown = false;
 
   closeBtn.addEventListener('click', () => {
     stopCamera();
@@ -10474,7 +10475,11 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   async function startCamera(){
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
+        video: {
+          facingMode: 'environment',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
         audio: false
       });
       video.srcObject = stream;
@@ -10509,8 +10514,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
 
       if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+        const MAX_WIDTH = 720;
+        const scale = video.videoWidth > MAX_WIDTH ? MAX_WIDTH / video.videoWidth : 1;
+        canvas.width = Math.round(video.videoWidth * scale);
+        canvas.height = Math.round(video.videoHeight * scale);
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const code = jsQR(imageData.data, imageData.width, imageData.height, {
@@ -10523,6 +10530,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       }
     } catch (err) {
       console.error('Error leyendo el QR:', err);
+      if (!errorShown) {
+        errorShown = true;
+        setMessage('Error leyendo la cámara, recarga la página', 'empty');
+      }
     } finally {
       requestAnimationFrame(tick);
     }
